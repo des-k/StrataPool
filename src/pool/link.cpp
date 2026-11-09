@@ -176,6 +176,9 @@ KV PoolLink::config_for(size_t i) const {
     c.set("last", (int64_t) (i + 1 == workers_.size()));
     c.set("wire", std::string(wire_name(wire_)));
     c.set("draft_wire", std::string(wire_name(draft_wire_)));
+    // --vision: the worker keeps its own M-RoPE cell table.  Its size needs no key: it is max_context + 64 on every
+    // PC, and max_context is the coordinator's from `common` (the worker takes it from this same CONFIG).
+    if (vision_) c.set("vision", (int64_t) 1);
     return c;
 }
 
@@ -956,6 +959,26 @@ bool PoolLink::all_ready(const char* key) const {
     for (const WorkerInfo& w : workers_)
         if (w.ready.i64(key, 0) != 1) return false;
     return !workers_.empty();
+}
+
+bool PoolLink::set_mrope(const int32_t* cells, int64_t cell0, int64_t n, std::string& err) {
+    if (cells == nullptr || cell0 < 0 || n < 1) { err = "pool: image positions out of range"; return false; }
+    std::lock_guard<std::mutex> lk(mu_);
+    // a worker without the table would rotate its layers by the identity while this PC rotates them by the image's
+    // (t, h, w): wrong tokens, not an error.  The caller keeps images off when this says no (vision_ok).
+    if (!vision_ok()) { err = "pool: image positions asked for, but a worker has no position table"; return false; }
+    Packer pk;
+    pk.put<int64_t>(cell0);
+    pk.put<int32_t>((int32_t) n);
+    for (size_t i = 0; i < ch_.size(); ++i) {
+        if (!ch_[i].send(Msg::Mrope, pk.b.data(), pk.b.size(), cells + cell0 * 3,
+                         (size_t) n * 3 * sizeof(int32_t), err)) {
+            err = "pool worker " + workers_[i].addr + ": " + err;
+            return false;
+        }
+        ++ch_[i].pending;
+    }
+    return true;
 }
 
 bool PoolLink::end_request(std::string& err) {

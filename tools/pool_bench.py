@@ -17,17 +17,21 @@ Tests (about 4-6 minutes in all):
   agent     two sibling conversations on one ~3K-token system prompt, turns that switch between them:
             what each turn reads again (parked conversations, borrowing) and how long it waits for its first token
   pair      the code and prose requests at the same time                          both together (two chats)
+  picture   one image to describe (needs --picture PATH; the server needs its picture reader on):
+            its answer's `text_sha1` is what two runs are compared by - alone vs split, or two pool settings
 `--only code,prose` runs a part; `--skip pair` leaves one out.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import pathlib
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -56,6 +60,15 @@ def corpus(chars: int, offset: int = 0) -> str:
     while len(text) < offset + chars:
         text += text
     return text[offset:offset + chars]
+
+
+def data_url(path: pathlib.Path) -> str:
+    """A picture as a data: URL.  The bench reads the file itself, so the server may be another PC: given a plain
+    path it would look for that path on its own computer (serve/server.py's Vision.load takes data:, http(s) or a
+    local path)."""
+    kind = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "bmp": "image/bmp",
+            "webp": "image/webp", "tiff": "image/tiff"}.get(path.suffix.lower().lstrip("."), "image/png")
+    return f"data:{kind};base64,{base64.b64encode(path.read_bytes()).decode()}"
 
 
 def post(url: str, body: dict, timeout: float = 1800) -> tuple[dict, float]:
@@ -110,8 +123,20 @@ def main() -> int:
     ap.add_argument("--only", default="", help="comma-separated tests to run")
     ap.add_argument("--skip", default="", help="comma-separated tests to leave out")
     ap.add_argument("--no-warmup", action="store_true", help="skip the unrecorded first request")
+    ap.add_argument("--picture", default="", metavar="PATH",
+                    help="adds the `picture` test: this image sent as a data: URL, described in one sentence.  The "
+                         "server needs its picture reader on; compare the answer's text_sha1 between two runs")
     a = ap.parse_args()
-    tests = ["code", "prose", "long", "short", "agent", "pair"]
+    pic = None
+    if a.picture:
+        pfile = pathlib.Path(a.picture)
+        if not pfile.is_file():
+            print(f"--picture: there is no file {a.picture}")
+            return 2
+        pic = data_url(pfile)
+    tests = ["code", "prose", "long", "short", "picture", "agent", "pair"]
+    if pic is None:
+        tests = [t for t in tests if t != "picture"]     # no image given: the test has nothing to send
     if a.only:
         tests = [t for t in tests if t in a.only.split(",")]
     tests = [t for t in tests if t not in a.skip.split(",")]
@@ -136,6 +161,20 @@ def main() -> int:
         for n, chars in ((500, 1900), (2000, 7600), (2800, 10600)):
             ask(a.url, [{"role": "user", "content": tag + f"({n}) Summarize this in one sentence:\n\n" +
                          corpus(chars, offset=40000 + chars)}], 24, f"short ~{n}", results)
+    if "picture" in tests:
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": tag + "What is in this picture? Answer in one short sentence."},
+            {"type": "image_url", "image_url": {"url": pic}}]}]
+        try:
+            ask(a.url, msgs, 96, "picture", results)
+        except urllib.error.HTTPError as e:
+            # the usual reason is a server without a picture reader, or a pool whose workers predate the image
+            # positions: name that instead of ending the run with a traceback
+            detail = e.read().decode("utf-8", "replace")[:300]
+            results.append({"test": "picture", "error": f"HTTP {e.code}", "detail": detail})
+            print(f"  ! picture: the server refused the image ({e.code}): {detail}", flush=True)
+            print("    the server needs a model set up with the picture reader; in a pool it needs this version's "
+                  "engine on every PC (docs/POOL_VISION.md)", flush=True)
     if "agent" in tests:
         system = (tag + "You are a coding agent working in a repository. The project's documentation follows; use it "
                   "to answer.\n\n" + corpus(11500, offset=80000))

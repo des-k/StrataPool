@@ -177,7 +177,9 @@ class Config(unittest.TestCase):
     def test_problems(self):
         pc = PoolConfig(None, {"role": "worker"})
         self.assertEqual(config_problems({"args": []}, pc), [])
-        self.assertEqual(len(config_problems({"args": [], "vision": {"exe": "v"}}, pc)), 1)
+        # images: a worker takes the picture decision from its coordinator (CONFIG vision=1), so a tower in its own
+        # config is no problem; the coordinator needs an engine that carries the position frames (below)
+        self.assertEqual(config_problems({"args": [], "vision": {"exe": "v"}}, pc), [])
         self.assertEqual(len(config_problems({"args": ["--control-vector-scaled", "x:1"], "gpu": "0,1"}, pc)), 2)
         self.assertEqual(config_problems({"args": [], "vision": {}}, PoolConfig(None, {"role": "off"})), [])
         # DeepSeek-V4.1 has its own engine (no layer split): the split roles refuse it with one line, routing takes it
@@ -195,6 +197,19 @@ class Config(unittest.TestCase):
             self.assertIn("built without", config_problems({"args": [], "exe": str(old)}, pc)[0])
             self.assertEqual(config_problems({"args": [], "exe": str(new)}, pc), [])
             self.assertEqual(config_problems({"args": [], "exe": str(old)}, PoolConfig(None, {"role": "router"})), [])
+            # pictures across the split travel as MROPE frames: the coordinator's engine needs them, and an older
+            # build is a problem it is told about (it would rotate the worker's layers by the wrong positions)
+            coord = PoolConfig(None, {"role": "coordinator"})
+            tower = {"exe": "strata-vision.exe"}   # a config's vision section is empty when the model has no tower
+            got = config_problems({"args": [], "vision": tower, "exe": str(new)}, coord)
+            self.assertEqual(len(got), 1)
+            self.assertIn("image positions", got[0])
+            img = Path(d) / "img.exe"
+            img.write_bytes(b"MZ... --pool-listen [H:]P ... MROPE")
+            self.assertEqual(config_problems({"args": [], "vision": tower, "exe": str(img)}, coord), [])
+            # without a tower in its config nothing is asked of the engine, and a worker is not asked at all
+            self.assertEqual(config_problems({"args": [], "exe": str(new)}, coord), [])
+            self.assertEqual(config_problems({"args": [], "vision": tower, "exe": str(new)}, pc), [])
 
     def test_engine_pool_info(self):
         p = parse_engine_pool({"pool": "coordinator", "pool_layers": "0-21",

@@ -50,6 +50,7 @@ const char* msg_name(Msg m) {
     case Msg::ConvRestore: return "CONV_RESTORE";
     case Msg::ConvRetain: return "CONV_RETAIN";
     case Msg::ConvBorrow: return "CONV_BORROW";
+    case Msg::Mrope: return "MROPE";
     case Msg::Ack: return "ACK";
     case Msg::Err: return "ERR";
     case Msg::Bye: return "BYE";

@@ -12,8 +12,8 @@
 // worker's HELLO: AUTH (the HMAC of the worker's nonce under the shared secret), then CONFIG (the layer range and
 // everything that must match: context, KV format, window size, rope).  The worker loads its share and answers
 // READY.  After that every request message gets exactly one reply, in order; COMMIT, RESET, CKPT_SAVE,
-// CKPT_RETAIN and END_REQ are acknowledged lazily (the coordinator drains their ACKs before its next request), so a
-// commit costs no round trip of its own.
+// CKPT_RETAIN, MROPE and END_REQ are acknowledged lazily (the coordinator drains their ACKs before its next
+// request), so a commit costs no round trip of its own.
 //
 // FRAMES.  A 24-byte little-endian header (magic, type, flags, length) and `length` bytes of payload.  Control
 // payloads (HELLO, AUTH, CONFIG, READY, STATS, ERR) are "key=value" lines; data payloads are packed binary.
@@ -65,6 +65,10 @@ enum class Msg : uint16_t {
     ConvRestore = 33,// u64 id: put that image back into the session                                     (ACK / Err)
     ConvRetain = 34, // u32 n, u64 ids[n]: drop every other image                                        (lazy ACK)
     ConvBorrow = 35, // u64 id, i64 n: the first n tokens' K/V from that image into the session; it stays (ACK / Err)
+    // --vision: the M-RoPE cell table (t, h, w).  Every rope kernel reads its own PC's copy (kernels/mrope.hpp), so
+    // each PC needs one and a picture request ships the coordinator's cells to the workers before its first window.
+    // VERIFY and PREFILL carry cell indices as they always did; only the table's contents differ from a text run.
+    Mrope = 36,      // i64 cell0, i32 n, int32 cells[n*3]: (t, h, w) of cell0 .. cell0 + n - 1     (lazy ACK)
     Ack = 30,
     Err = 31,        // message=<text>
     Bye = 40,        // the coordinator is leaving; the worker keeps its load for the next one

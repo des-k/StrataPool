@@ -152,6 +152,10 @@ and mostly agree.
 ```
 POOL-SELFTEST.bat                         (or: .venv\Scripts\python tools\pool_selftest.py strata-<model>.json)
 POOL-SELFTEST.bat --split 30 --wire f16   other options: --ctx, --cache, --chunk, --max-new, --skip-single
+.venv\Scripts\python tools\pool_selftest.py strata-<model>.json --picture shot.png
+                                          ^ a fourth request with an image: it checks the picture's positions across
+                                            the split too ([POOL_VISION.md](POOL_VISION.md)); needs a model set up
+                                            with the picture reader
 ```
 
 ## Settings (Pool tab)
@@ -329,8 +333,11 @@ out of the pool. The automatic split would give it as few layers as it can.
 
 ## What is not supported yet
 
-- **Images** (vision), the **experimental speed projection** (control vectors) and the **low-RAM modes**. The Pool tab
-  says when your setup has one of them on.
+- The **experimental speed projection** (control vectors) and the **low-RAM modes**. The Pool tab says when your setup
+  has one of them on.
+- **Images** need this version's engine on **every** PC of the pool: each PC rotates its own layers by its own copy of
+  the picture's positions, and a worker built before it turns pictures off rather than answer wrongly.
+  How it works and what is still unproven: **[POOL_VISION.md](POOL_VISION.md)**.
 - **Several GPUs in one pool PC.** Each pool PC uses one GPU, and the pool is the split.
 - From Strata 0.1.40: **`--kv-grow`** (the elastic K/V; off with a note - it also needs the whole K/V in VRAM, which a
   long context with `--kv-resident` does not have) and **session files** (`/slots/0?action=save|restore` answers that
@@ -398,6 +405,7 @@ exchange sums twice per layer, which needs the cards in one PC).
 | The worker's handshake and its "busy" answer | `src/pool/worker.cpp` |
 | The split search | `src/pool/split.cpp` |
 | The coordinator's link: workers, the head, prompt rows | `src/pool/link.cpp` |
+| Pictures across the split: each PC's M-RoPE cell table | `include/strata/kernels/mrope.hpp`, `Msg::Mrope`, [POOL_VISION.md](POOL_VISION.md) |
 | The verifier's and prompt path's hand-off to the network | `Verifier::set_link` / `set_headless`, `Prefill::remote_next` / `set_headless` |
 | Each node's experts in RAM for its range only | `ArenaExpertSource::set_layer_range` |
 | The worker's serve loop, and the coordinator's hooks | `src/program/generate.cpp` (search for `POOL`) |

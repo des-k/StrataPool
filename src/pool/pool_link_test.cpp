@@ -40,11 +40,15 @@ struct FakeWorker {
     float add;
     std::atomic<int> runs{0}, bcommits{0}, last_keep0{0}, verifies{0}, commits{0}, resets{0}, prefills{0}, sessions{0}, batches{0}, slot_loads{0}, slot_stores{0};
     std::atomic<int> last_base{-1}, last_slot{-1};
+    std::atomic<int> mropes{0};       // --vision: MROPE frames taken
+    std::vector<int32_t> mrope_cells; // the cells of the last one (mu)
+    int64_t mrope_cell0 = -1;         // its first cell (mu)
     std::set<uint64_t> ckpts;
     std::set<uint64_t> convs;   // parked conversations
     std::mutex mu;
     bool reload_first = false;     // answer the first CONFIG with "reload" (it had another range)
     bool wrong_model = false;
+    bool supports_mrope = true;    // false: a worker built before image positions crossed the split (no mrope in READY)
     int port = 0;
     std::atomic<bool> stop{false};
 
@@ -85,6 +89,9 @@ struct FakeWorker {
                 ready.set("chunk", (int64_t) 64);
                 ready.set("cache_mib", (int64_t) 2048);
                 ready.set("conv_park", (int64_t) 1);
+                // a worker of a pool that carries pictures says it keeps its own position table (the real one says it
+                // when its build has the MROPE frame; see generate.cpp's READY)
+                if (supports_mrope && cfg.i64("vision", 0) == 1) ready.set("mrope", (int64_t) 1);
                 std::string e;
                 ch.send(Msg::Ready, ready, e);
                 std::vector<uint8_t> p;
@@ -202,6 +209,25 @@ struct FakeWorker {
                         for (uint32_t i = 0; i < n; ++i) { uint64_t id; u.get(id); keep.insert(id); }
                         { std::lock_guard<std::mutex> g(mu); std::set<uint64_t> k2; for (auto id : convs) if (keep.count(id)) k2.insert(id); convs = k2; }
                         ch.send(Msg::Ack, e);
+                    } else if (t == Msg::Mrope) {
+                        // i64 cell0, i32 n, int32 cells[n*3]: the coordinator's (t, h, w) for a picture request
+                        int64_t cell0 = 0;
+                        int32_t n = 0;
+                        if (!u.get(cell0) || !u.get(n) || n < 1 || u.left() != (size_t) n * 3 * sizeof(int32_t)) {
+                            KV no;
+                            no.set("message", std::string("malformed image positions"));
+                            ch.send(Msg::Err, no, e);
+                            break;
+                        }
+                        std::vector<int32_t> got((size_t) n * 3);
+                        std::memcpy(got.data(), u.here(), got.size() * sizeof(int32_t));
+                        {
+                            std::lock_guard<std::mutex> g(mu);
+                            mrope_cell0 = cell0;
+                            mrope_cells = std::move(got);
+                        }
+                        ++mropes;
+                        ch.send(Msg::Ack, e);   // lazily: the coordinator drains it with the request's other ACKs
                     } else if (t == Msg::EndRequest) {
                         KV st;
                         st.set("windows", (int64_t) 4);
@@ -404,10 +430,79 @@ static void test_reload_and_busy() {
     link.bye();
 }
 
+// --vision across the split: CONFIG says the pool carries pictures, every worker answers with its own position
+// table, the cells reach each of them before the request's end drains their ACKs, and a worker that has no table
+// keeps images off (a worker rotating its layers by the identity while this PC rotates them by (t, h, w) would
+// answer with wrong tokens rather than fail, which is why the link refuses to half-ship them).
+static void test_vision_positions() {
+    std::string err;
+    std::vector<int32_t> tab(64 * 3);
+    for (int32_t i = 0; i < 64; ++i) {
+        tab[(size_t) i * 3] = i;
+        tab[(size_t) i * 3 + 1] = i + 7;
+        tab[(size_t) i * 3 + 2] = i + 11;
+    }
+    {
+        FakeWorker a("s", 0), b("s", 0);
+        a.run(1);
+        b.run(1);
+        PoolLink link;
+        CHECK(link.connect({"127.0.0.1:" + std::to_string(a.port), "127.0.0.1:" + std::to_string(b.port)}, "s", fp(),
+                           10.0, 10.0, err));
+        link.set_vision(true);
+        KV c;
+        c.set("max_context", (int64_t) 4096);
+        CHECK(link.configure({24}, 48, c, Wire::F32, Wire::F16, err));
+        CHECK(link.wait_ready(10.0, err));
+        CHECK(link.vision_ok());
+        CHECK(link.set_mrope(tab.data(), 0, 64, err));   // the whole table, as the first picture of a request sends it
+        CHECK(link.set_mrope(tab.data(), 8, 4, err));    // a range: a later request's shifted tail
+        CHECK(link.end_request(err));                    // drains both frames' ACKs (a missing one fails here)
+        CHECK(a.mropes == 2 && b.mropes == 2);
+        for (FakeWorker* w : {&a, &b}) {
+            std::lock_guard<std::mutex> g(w->mu);
+            CHECK(w->mrope_cell0 == 8 && w->mrope_cells.size() == 12);
+            CHECK(!w->mrope_cells.empty() && w->mrope_cells[0] == 8 && w->mrope_cells[1] == 15 &&
+                  w->mrope_cells[2] == 19);
+        }
+        link.bye();
+    }
+    {   // a worker whose engine has no table: images are off for the pool, and the link will not send cells to it
+        FakeWorker old("s", 0);
+        old.supports_mrope = false;
+        old.run(1);
+        PoolLink link;
+        err.clear();
+        CHECK(link.connect({"127.0.0.1:" + std::to_string(old.port)}, "s", fp(), 10.0, 10.0, err));
+        link.set_vision(true);
+        KV c;
+        CHECK(link.configure({24}, 48, c, Wire::F32, Wire::F16, err));
+        CHECK(link.wait_ready(10.0, err));
+        CHECK(!link.vision_ok());
+        err.clear();
+        CHECK(!link.set_mrope(tab.data(), 0, 4, err));
+        CHECK(err.find("position table") != std::string::npos);
+        link.bye();
+    }
+    {   // a text pool: CONFIG says nothing about pictures, so no worker advertises the table
+        FakeWorker w("s", 0);
+        w.run(1);
+        PoolLink link;
+        err.clear();
+        CHECK(link.connect({"127.0.0.1:" + std::to_string(w.port)}, "s", fp(), 10.0, 10.0, err));
+        KV c;
+        CHECK(link.configure({24}, 48, c, Wire::F32, Wire::F16, err));
+        CHECK(link.wait_ready(10.0, err));
+        CHECK(!link.vision_ok());
+        link.bye();
+    }
+}
+
 int main() {
     net_init();
     test_two_workers(Wire::F32);
     test_two_workers(Wire::F16);
+    test_vision_positions();
     test_refusals();
     test_reload_and_busy();
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }

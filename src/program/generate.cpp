@@ -3848,7 +3848,6 @@ int main(int argc, char** argv) {
         else if (!o.serve) why = "a pool runs with --serve";
         else if (!o.layer_split.empty() || !o.split_device.empty())
             why = "a pool node uses one GPU (no --layer-split; the pool is the split)";
-        else if (o.vision) why = "images are not supported in a pool yet: turn vision off for the pool's model";
         else if (!o.cvec_files.empty()) why = "control vectors (the speed projection) are not supported in a pool yet";
         else if (o.expert_cache_remote[0] > 0) why = "--expert-cache-remote is not supported in a pool";
         else if (o.mmap_experts || o.resident_cpu_experts)
@@ -3864,6 +3863,9 @@ int main(int argc, char** argv) {
         // parked conversations: the coordinator parks its layers and the draft layer, every worker its own layers
         // (CONV_PARK); a worker that cannot (an older engine) turns parking off once the workers are ready
         if (pool_worker) o.mtp.clear();   // the coordinator drafts; a worker runs layers only
+        // a worker's images come from the coordinator's CONFIG, not from its own command line: the pool carries
+        // pictures or it does not, and a worker that says --vision on its own would build a table nobody fills
+        if (pool_worker) o.vision = false;
         // --batch in a pool: the slot groups are pipelined across the PCs (one group per PC at a time), so while a
         // worker runs one conversation's layers this PC runs another's.  Groups of one slot overlap the most.  A
         // worker's slot count is the coordinator's (CONFIG), not its own config's.
@@ -5192,6 +5194,10 @@ int main(int argc, char** argv) {
         o.batch = (int) std::clamp<int64_t>(pool_cfg.i64("batch", 0), 0, strata::kernels::kVerifyMaxT);   // slot sessions
         pool_wide_rows = pool_cfg.i64("batch_mtp", 0) != 0;   // --batch-mtp: a slot's rows carry its draft too
         pool_tail_skip = (int) pool_cfg.i64("tail_skip", -1);
+        // --vision: every rope kernel of this PC's layers reads its own M-RoPE cell table, so a worker of a pool that
+        // carries pictures needs one.  It is allocated below, with the coordinator's max_context (this same CONFIG)
+        // and before any graph of these layers is captured - the rule kernels/mrope.hpp puts on it.
+        o.vision = pool_cfg.i64("vision", 0) != 0;
         {   // the coordinator's pool-wide opt-ins (kPoolForwardEnv), where this PC has not set its own
             const std::string fwd = pool_cfg.str("env", "");
             std::string took;
@@ -5460,6 +5466,9 @@ int main(int argc, char** argv) {
         common.set("rope_attn_factor", rope_cfg.attn_factor);
         common.set("rope_beta_fast", rope_cfg.beta_fast);
         common.set("rope_beta_slow", rope_cfg.beta_slow);
+        // --vision: the rope *scaling* travels in `common` above; what a picture adds is the per-cell (t, h, w)
+        // table, which every PC needs as its own copy (CONFIG vision=1 tells the worker to keep one).
+        pool_link.set_vision(o.vision);
         if (!pool_link.configure(pool_at, g.n_layers, common, pool_wire, pool_draft_wire, err)) {
             std::fprintf(stderr, "strata pool: %s\n", err.c_str());
             return 1;
@@ -5610,7 +5619,9 @@ int main(int argc, char** argv) {
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
     strata::kernels::native_rope_set_enabled(o.native_rope);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
-    // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
+    // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.  A pool
+    // PC is under the same rule for its own layers: the coordinator by this flag, the worker by CONFIG (vision=1),
+    // and every PC keeps its own copy - which is what Msg::Mrope carries on a picture request.
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
     if (o.vision) {
@@ -10794,6 +10805,14 @@ int main(int argc, char** argv) {
                                      "the pool keeps the per-chat checkpoints only\n");
                 o.conversation_cache_mib = 0;
             }
+            // --vision: a worker whose engine has no position table would rotate its layers by the identity while
+            // this PC rotates them by the image's (t, h, w) - that answers with wrong tokens rather than failing, so
+            // the pool takes pictures off and says why instead of sending them.
+            if (o.vision && !pool_link.vision_ok()) {
+                std::fprintf(stderr, "strata pool: a worker runs an engine without image positions (rebuild it there); "
+                                     "images are off for this pool\n");
+                o.vision = false;
+            }
             // --batch: as many slots as every PC carved (a worker says how many fit beside its layers)
             if (o.batch > 0) {
                 const int64_t wb = pool_link.batch_slots();
@@ -14189,6 +14208,10 @@ int main(int argc, char** argv) {
                 r.set("lb", node_lb);
                 r.set("le", node_le);
                 r.set("conv_park", (int64_t) 1);   // CONV_PARK / CONV_RESTORE / CONV_RETAIN
+                // the table exists only if this process allocated it at start: a second coordinator that turns
+                // pictures on for a worker that loaded without them gets "no mrope" (images off), not a frame it
+                // cannot apply - the table cannot be allocated between requests, only before the graphs are captured
+                if (d_mrope != nullptr) r.set("mrope", (int64_t) 1);   // this build takes MROPE frames (Msg::Mrope)
                 std::string e;
                 if (!pool_ch.send(strata::pool::Msg::Ready, r, e)) {
                     std::fprintf(stderr, "strata pool: %s\n", e.c_str());
@@ -14259,7 +14282,37 @@ int main(int argc, char** argv) {
                     std::string e;
                     if (!pool_ch.recv(t, msg, e, (uint64_t) 8 << 30)) { why = e; break; }
                     strata::pool::Unpacker u(msg.data(), msg.size());
-                    if (t == strata::pool::Msg::Verify) {
+                    if (t == strata::pool::Msg::Mrope) {
+                        // --vision: the coordinator's cell positions for this request; the channel's order keeps them
+                        // ahead of its first window.  This PC's table was allocated with the coordinator's
+                        // max_context (same CONFIG), so a range past it means the two PCs disagree about the model:
+                        // stop the request rather than rotate this PC's layers by the wrong positions.
+                        int64_t cell0 = 0;
+                        int32_t n = 0;
+                        if (!u.get(cell0) || !u.get(n) || n < 1) {
+                            fail("a malformed image position frame");
+                            fatal = true;
+                            break;
+                        }
+                        if (d_mrope == nullptr) {   // READY said no mrope, so this should not come: say what it is
+                            fail("this worker loaded without an image position table: restart it");
+                            fatal = true;
+                            break;
+                        }
+                        if (cell0 < 0 || cell0 + n > (int64_t) mrope_host.size() / 3 ||
+                            u.left() != (size_t) n * 3 * sizeof(int32_t)) {
+                            fail("a malformed image position frame");
+                            fatal = true;
+                            break;
+                        }
+                        if (cudaMemcpy(d_mrope + cell0 * 3, u.here(), (size_t) n * 3 * sizeof(int32_t),
+                                       cudaMemcpyHostToDevice) != cudaSuccess) {
+                            fail("the image position upload failed");
+                            fatal = true;
+                            break;
+                        }
+                        if (!ack()) { why = "the coordinator went away"; break; }
+                    } else if (t == strata::pool::Msg::Verify) {
                         int32_t T = 0;
                         int64_t pos0 = 0;
                         int32_t toks[strata::kernels::kVerifyMaxT];
@@ -16871,7 +16924,14 @@ int main(int argc, char** argv) {
                 continue;
             }
             req_imgs.clear();
-            if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            if (geni && !o.vision) {
+                // a pool that had to take pictures off (a worker without a position table) says so here too: the
+                // person did start this engine with --vision, and the plain line below would read as a setup mistake
+                std::printf("ERR this engine was started without --vision%s\n",
+                            pool_any ? " (this pool turned images off: rebuild the engine on every PC of the pool)"
+                                     : "");
+                continue;
+            }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
@@ -16941,7 +17001,9 @@ int main(int argc, char** argv) {
                 cudaDeviceSynchronize();
                 tr("device idle");
                 // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
+                std::string pool_pos_err;
                 auto upload_mrope = [&]() -> bool {
+                    pool_pos_err.clear();
                     bool ok = cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                          cudaMemcpyHostToDevice) == cudaSuccess;
                     for (auto& st : stages) {
@@ -16950,9 +17012,16 @@ int main(int argc, char** argv) {
                         ok = ok && cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                               cudaMemcpyHostToDevice) == cudaSuccess;
                     }
+                    // POOL: the same rule one level up - each PC rotates its own layers by its own copy, so the
+                    // workers get these cells before the request's first window (the channel keeps the frame ahead of
+                    // it).  Acknowledged lazily with the window's other ACKs, so a picture costs no round trip.
+                    if (ok && pool_coord && o.vision)
+                        ok = pool_link.set_mrope(mrope_host.data(), 0, (int64_t) mrope_host.size() / 3, pool_pos_err);
                     return ok;
                 };
-                if (ve.empty() && !upload_mrope()) ve = "the image position upload failed";
+                if (ve.empty() && !upload_mrope())
+                    ve = pool_pos_err.empty() ? "the image position upload failed"
+                                              : "the image positions did not reach every PC: " + pool_pos_err;
                 if (!ve.empty()) {
                     // leave the table as the identity so the next text request is untouched
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);

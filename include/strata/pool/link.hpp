@@ -157,6 +157,16 @@ public:
     bool conv_retain(const std::vector<uint64_t>& ids, std::string& err);
     /// a new conversation that starts with a parked one's checkpoint: the first n tokens' K/V from that image (#1164)
     bool conv_borrow(uint64_t id, int64_t n, std::string& err);
+    /// --vision: tell the workers this pool carries images (CONFIG vision=1), so each keeps its own M-RoPE cell table.
+    /// Set before `configure`: a worker allocates its table while it loads, before any graph of its layers is captured.
+    void set_vision(bool on) { vision_ = on; }
+    /// every worker loaded an engine that keeps that table (READY mrope=1).  A worker without it must not be given
+    /// pictures: it would rotate its layers by the identity while this PC rotates them by the image's (t, h, w),
+    /// which answers with wrong tokens rather than with an error.
+    bool vision_ok() const { return vision_ && all_ready("mrope"); }
+    /// a picture request: the cells [cell0, cell0 + n) of this PC's table to every worker, before the request's first
+    /// window (the channel's order keeps them ahead of it).  Acknowledged lazily with the request's other ACKs.
+    bool set_mrope(const int32_t* cells, int64_t cell0, int64_t n, std::string& err);
     /// every worker said "<key>=1" in READY (a capability an older worker lacks)
     bool all_ready(const char* key) const;
     uint64_t new_ckpt_id() { return ++ckpt_seq_; }
@@ -187,6 +197,7 @@ private:
     std::vector<Channel> ch_;
     std::mutex mu_;
     Wire wire_ = Wire::F32, draft_wire_ = Wire::F16;
+    bool vision_ = false;             // --vision: CONFIG carries vision=1 and the workers keep their own cell table
     double timeout_s_ = 300.0, wait_s_ = 900.0;
     std::string secret_;
     ModelFingerprint fp_;

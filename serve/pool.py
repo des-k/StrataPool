@@ -302,6 +302,20 @@ def engine_has_pool(exe: str | None) -> bool | None:
     return b"--pool-listen" in data
 
 
+def engine_has_image_split(exe: str | None) -> bool | None:
+    """Whether the engine binary carries the MROPE frame, which is what lets a pool carry pictures: every PC rotates
+    its own layers by its own copy of the image position table, so a worker built before it would rotate them by the
+    identity and answer with wrong tokens.  None when the binary cannot be read."""
+    if not exe:
+        return None
+    try:
+        with open(exe, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    return b"MROPE" in data
+
+
 def config_problems(cfg: dict, pc: PoolConfig) -> list[str]:
     """What in the run config a pool cannot do (the engine refuses these too; the Pool tab says so first)."""
     if pc.role in ("off", "router"):           # routing: every PC runs the whole model as it would alone
@@ -317,8 +331,10 @@ def config_problems(cfg: dict, pc: PoolConfig) -> list[str]:
     if engine_has_pool(exe) is False:
         out.append("this PC's engine was built without the layer split (an older or ready-made build): compile this "
                    "version's engine with START-HERE.bat --build, or use Share requests, which works with any engine")
-    if cfg.get("vision"):
-        out.append("images (vision) are on: a pool runs text only for now - run setup again with images off")
+    if cfg.get("vision") and pc.role == "coordinator" and engine_has_image_split(exe) is False:
+        out.append("images (vision) are on but this PC's engine has no image positions for a pool: compile this "
+                   "version's engine on every PC of the pool with START-HERE.bat --build (a worker built without them "
+                   "turns pictures off, because it would rotate its own layers by the wrong positions)")
     if any(a in ("--control-vector", "--control-vector-scaled") for a in args):
         out.append("the experimental speed projection is on: a pool does not support it yet")
     if any(a in ("--mmap-experts", "--resident-experts", "--resident-cpu-experts") for a in args):
